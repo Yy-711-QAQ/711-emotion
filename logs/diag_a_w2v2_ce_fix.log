@@ -1,0 +1,43 @@
+Start loading the data....
+Start loading the EmotionTalk data....
+# Train samples = 5610
+# Valid samples = 840
+# Test samples = 793
+=== Epoch 1 ===
+phase (acc)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Train           0.7118 ↑    0.3948 ↑    0.1374 ↑    0.2070 ↑    0.4144 ↑    0.8843 ↑    0.2647 ↑    0.4306 ↑   
+phase (recall)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Train           0.3858 ↑    0.7323 ↑    0.9714 ↑    1.0000 ↑    0.8991 ↑    0.2335 ↑    0.8825 ↑    0.7292 ↑   
+phase (precision)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Train           0.3017 ↑    0.1053 ↑    0.0533 ↑    0.2070 ↑    0.3203 ↑    0.1656 ↑    0.1162 ↑    0.1813 ↑   
+phase (f1)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Train           0.3387 ↑    0.1841 ↑    0.1011 ↑    0.3429 ↑    0.4723 ↑    0.1938 ↑    0.2054 ↑    0.2626 ↑   
+phase (auc)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Train           0.6323 ↑    0.5400 ↑    0.6155 ↑    0.5307 ↑    0.6253 ↑    0.7226 ↑    0.6016 ↑    0.6097 ↑   
+phase (acc)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Valid           0.5476 ↑    0.1274 ↑    0.9357 ↑    0.1964 ↑    0.6226 ↑    0.8595 ↑    0.3548 ↑    0.5206 ↑   
+phase (recall)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Valid           0.7701 ↑    0.8947 ↑    0.2653 ↑    1.0000 ↑    0.8456 ↑    0.2268 ↑    0.8824 ↑    0.6978 ↑   
+phase (precision)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Valid           0.2994 ↑    0.0227 ↑    0.4194 ↑    0.1964 ↑    0.4554 ↑    0.3385 ↑    0.0775 ↑    0.2585 ↑   
+phase (f1)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Valid           0.4311 ↑    0.0443 ↑    0.3250 ↑    0.3284 ↑    0.5920 ↑    0.2716 ↑    0.1424 ↑    0.3050 ↑   
+phase (auc)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Valid           0.6893 ↑    0.4551 ↑    0.7680 ↑    0.5884 ↑    0.7269 ↑    0.6853 ↑    0.6016 ↑    0.6449 ↑   
+phase (acc)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Test            0.6671 ↑    0.1942 ↑    0.1690 ↑    0.1337 ↑    0.5763 ↑    0.8537 ↑    0.3480 ↑    0.4203 ↑   
+phase (recall)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Test            0.7174 ↑    0.9403 ↑    0.9516 ↑    1.0000 ↑    0.8119 ↑    0.4211 ↑    0.9068 ↑    0.8213 ↑   
+phase (precision)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Test            0.3837 ↑    0.0903 ↑    0.0825 ↑    0.1337 ↑    0.3750 ↑    0.1455 ↑    0.1746 ↑    0.1979 ↑   
+phase (f1)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Test            0.5000 ↑    0.1647 ↑    0.1519 ↑    0.2358 ↑    0.5130 ↑    0.2162 ↑    0.2927 ↑    0.2963 ↑   
+phase (auc)    angry    disgusted    fearful    happy    neutral    sad    surprised    average
+Test            0.7387 ↑    0.6145 ↑    0.7196 ↑    0.4795 ↑    0.6933 ↑    0.6076 ↑    0.6140 ↑    0.6382 ↑   
+Train thresholds:  [0.65 0.6  0.55 0.05 0.65 0.6  0.6 ]
+Valid thresholds:  [0.65 0.6  0.6  0.05 0.65 0.6  0.6 ]
+Saved best model to: ./savings/models/emotiontalk_mme2e_a_best_epoch1.pt
+=== Best performance ===
+Best epoch: 1
+Best test average f1: 0.296343
+Total time usage = 0.08 hours.

@@ -16,8 +16,6 @@ from PIL import Image
 
 #音频预处理函数
 def load_audio_waveform(audio_path, target_sr=16000, min_seconds=1.0):
-    if not os.path.exists(audio_path):
-        raise FileNotFoundError(f"Missing audio file: {audio_path}")
     waveform, sr = torchaudio.load(audio_path)
 
     # 转单声道
@@ -128,18 +126,7 @@ def get_dataset_emotiontalk(data_folder: str, phase: str, img_interval: int):
     if os.path.exists(bad_ids_path):
         bad_ids = set(open(bad_ids_path, 'r', encoding='utf-8').read().splitlines())
 
-    main_folder = os.path.join(data_folder, 'EMOTIONTALK_RAW_PROCESSED')
-
-    filtered_ids = []
-    for sid in ids:
-        if sid in bad_ids:
-            continue
-        audio_path = os.path.join(main_folder, sid, 'audio.wav')
-        if not os.path.exists(audio_path):
-            continue
-        filtered_ids.append(sid)
-
-    ids = filtered_ids
+    ids = [sid for sid in ids if sid not in bad_ids]
 
     texts = [meta[sid]['text'] for sid in ids]
     labels = [meta[sid]['label'] for sid in ids]

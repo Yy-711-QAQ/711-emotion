@@ -1,4 +1,4 @@
-import sparseconvnet as scn
+import spconv.pytorch as scn
 import torch
 from torch import nn
 from src.models.e2e_t import MME2E_T

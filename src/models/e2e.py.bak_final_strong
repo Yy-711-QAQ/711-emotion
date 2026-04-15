@@ -10,30 +10,6 @@ from src.models.transformer_encoder import WrappedTransformerEncoder
 from src.models.vgg_block import VggBasicBlock
 
 
-class AttentivePooling(nn.Module):
-    def __init__(self, in_dim):
-        super().__init__()
-        self.attn = nn.Sequential(
-            nn.Linear(in_dim, in_dim),
-            nn.Tanh(),
-            nn.Linear(in_dim, 1)
-        )
-
-    def forward(self, x, mask=None):
-        """
-        x: (B, T, H)
-        mask: (B, T) with 1 for valid, 0 for pad
-        """
-        score = self.attn(x).squeeze(-1)  # (B, T)
-
-        if mask is not None:
-            score = score.masked_fill(mask == 0, -1e9)
-
-        weight = torch.softmax(score, dim=1)  # (B, T)
-        pooled = torch.sum(x * weight.unsqueeze(-1), dim=1)  # (B, H)
-        return pooled, weight
-
-
 class MME2E(nn.Module):
     def __init__(self, args, device):
         super(MME2E, self).__init__()
@@ -52,10 +28,10 @@ class MME2E(nn.Module):
         if args['text_model_size'] == 'xlarge':
             text_cls_dim = 2048
 
-        # ===== Text =====
+        # ===== Text branch =====
         self.T = MME2E_T(feature_dim=self.feature_dim, size=args['text_model_size'])
 
-        # ===== Vision =====
+        # ===== Vision branch =====
         self.mtcnn = MTCNN(
             image_size=48,
             margin=2,
@@ -87,9 +63,10 @@ class MME2E(nn.Module):
             nn.ReLU(),
             nn.Linear(1024, trans_dim)
         )
+
         self.v_transformer = WrappedTransformerEncoder(dim=trans_dim, num_layers=nlayers, num_heads=nheads)
 
-        # ===== Audio: Wav2Vec2 frozen =====
+        # ===== Audio branch: Wav2Vec2 frozen =====
         self.wav2vec2 = Wav2Vec2Model.from_pretrained(
             "./models/wav2vec2-base",
             local_files_only=True
@@ -97,33 +74,36 @@ class MME2E(nn.Module):
         for p in self.wav2vec2.parameters():
             p.requires_grad = False
 
-        wav_dim = self.wav2vec2.config.hidden_size
-        self.a_pool = AttentivePooling(wav_dim)
-
         self.a_proj = nn.Sequential(
-            nn.Linear(wav_dim, 1024),
+            nn.Linear(self.wav2vec2.config.hidden_size, 1024),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(1024, trans_dim),
-            nn.ReLU()
+            nn.Linear(1024, trans_dim)
         )
 
-        # 不再让 audio 走单 token transformer
-        self.a_out = nn.Linear(trans_dim, self.num_classes)
+        # 可选：如果想让音频也走 transformer，可以保留
+        self.a_transformer = WrappedTransformerEncoder(dim=trans_dim, num_layers=nlayers, num_heads=nheads)
 
-        # ===== Heads =====
-        self.t_out = nn.Linear(text_cls_dim, self.num_classes)
+        # ===== Classification heads =====
         self.v_out = nn.Linear(trans_dim, self.num_classes)
+        self.t_out = nn.Linear(text_cls_dim, self.num_classes)
+        self.a_out = nn.Linear(trans_dim, self.num_classes)
 
         # 融合层
         self.weighted_fusion = nn.Linear(len(self.mod), 1, bias=False)
 
-        # 更小的音频 gate，默认抑制音频
-        self.a_gate_raw = nn.Parameter(torch.tensor(-2.5))  # sigmoid ~ 0.076
+        # 音频 gate：初始值较小，默认弱化音频
+        self.a_gate_raw = nn.Parameter(torch.tensor(-1.0))  # sigmoid(-1) ≈ 0.27
 
         self.debug = args.get('debug', False)
 
     def forward(self, imgs, imgs_lens, specs, spec_lens, text):
+        """
+        imgs: numpy or tensor, flattened frames, shape ~ (sum(imgLens), H, W, C)
+        imgs_lens: list[int]
+        specs: here it is padded raw waveform batch from collate_fn, shape (B, T)
+        spec_lens: list[int], raw waveform valid lengths
+        text: tokenizer outputs
+        """
         all_logits = []
         device = next(self.parameters()).device
 
@@ -179,7 +159,7 @@ class MME2E(nn.Module):
 
             all_logits.append(self.v_out(faces))
 
-        # ===== Audio branch =====
+        # ===== Audio branch: Wav2Vec2 =====
         if 'a' in self.mod:
             audio = specs.to(device).float()   # (B, T)
             B, T = audio.shape
@@ -194,24 +174,27 @@ class MME2E(nn.Module):
 
             hidden = wav_out.last_hidden_state  # (B, T', H)
 
+            # 根据 feature extractor 下采样长度，构造隐藏层 mask
             input_lengths = torch.tensor(spec_lens, device=device, dtype=torch.long)
             feat_lengths = self.wav2vec2._get_feat_extract_output_lengths(input_lengths)
             max_feat_len = hidden.size(1)
 
-            hidden_mask = torch.zeros((B, max_feat_len), dtype=torch.long, device=device)
+            hidden_mask = torch.zeros((B, max_feat_len), dtype=torch.float32, device=device)
             for i, l in enumerate(feat_lengths):
                 l = min(int(l.item()), max_feat_len)
-                hidden_mask[i, :l] = 1
+                hidden_mask[i, :l] = 1.0
 
-            pooled, attn_weight = self.a_pool(hidden, hidden_mask)   # (B, H)
-            a_feat = self.a_proj(pooled)                             # (B, trans_dim)
+            hidden_mask = hidden_mask.unsqueeze(-1)  # (B, T', 1)
+            pooled = (hidden * hidden_mask).sum(dim=1) / hidden_mask.sum(dim=1).clamp(min=1.0)  # (B, H)
+
+            a_feat = self.a_proj(pooled)  # (B, trans_dim)
+            a_feat = self.a_transformer(a_feat, [1] * a_feat.size(0), get_cls=True)
 
             if self.debug:
-                print("[DEBUG][A pooled] mean:", pooled.mean().item(), "std:", pooled.std().item())
-                print("[DEBUG][A feat] mean:", a_feat.mean().item(), "std:", a_feat.std().item())
+                print("[DEBUG][A] mean:", a_feat.mean().item(), "std:", a_feat.std().item())
 
             a_gate = torch.sigmoid(self.a_gate_raw)
-            a_logits = 0.5 * a_gate * self.a_out(a_feat)
+            a_logits = a_gate * self.a_out(a_feat)
 
             if self.debug:
                 print("[DEBUG][A_GATE]:", a_gate.item())
@@ -226,11 +209,11 @@ class MME2E(nn.Module):
             return all_logits[0]
 
         return self.weighted_fusion(torch.stack(all_logits, dim=-1)).squeeze(-1)
-        logits = self.weighted_fusion(torch.stack(all_logits, dim=-1)).squeeze(-1)
-        logits = logits / 0.7
-        return logits
 
     def crop_img_center(self, img: torch.Tensor, target_size=48):
+        """
+        img: (C, H, W)
+        """
         _, h, w = img.shape
         if h < target_size or w < target_size:
             out = torch.zeros(3, target_size, target_size, device=img.device, dtype=img.dtype)

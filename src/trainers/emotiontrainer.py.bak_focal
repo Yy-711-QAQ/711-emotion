@@ -7,25 +7,6 @@ from transformers import AutoTokenizer
 from src.evaluate import eval_iemocap
 from src.trainers.basetrainer import BaseTrainer
 
-import torch.nn.functional as F
-
-class FocalLoss(torch.nn.Module):
-    def __init__(self, gamma=2.0, reduction='mean'):
-        super().__init__()
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, logits, targets):
-        ce = F.cross_entropy(logits, targets, reduction='none')
-        pt = torch.exp(-ce)
-        loss = ((1 - pt) ** self.gamma) * ce
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        return loss
-
-
 
 EMOTIONTALK_LABELS = ["angry", "disgusted", "fearful", "happy", "neutral", "sad", "surprised"]
 
@@ -43,10 +24,6 @@ class IemocapTrainer(BaseTrainer):
         self.all_train_stats = []
         self.all_valid_stats = []
         self.all_test_stats = []
-
-        self.early_stop_patience = self.args.get('early_stop_patience', 3)
-        self.early_stop_min_delta = self.args.get('early_stop_min_delta', 1e-4)
-        self.no_improve_epochs = 0
 
     def _tokenize_text(self, texts):
         encoded = self.tokenizer(

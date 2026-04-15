@@ -3,35 +3,10 @@ import torch
 from torch import nn
 from torchvision import transforms
 from facenet_pytorch import MTCNN
-from transformers import Wav2Vec2Model
 
 from src.models.e2e_t import MME2E_T
 from src.models.transformer_encoder import WrappedTransformerEncoder
 from src.models.vgg_block import VggBasicBlock
-
-
-class AttentivePooling(nn.Module):
-    def __init__(self, in_dim):
-        super().__init__()
-        self.attn = nn.Sequential(
-            nn.Linear(in_dim, in_dim),
-            nn.Tanh(),
-            nn.Linear(in_dim, 1)
-        )
-
-    def forward(self, x, mask=None):
-        """
-        x: (B, T, H)
-        mask: (B, T) with 1 for valid, 0 for pad
-        """
-        score = self.attn(x).squeeze(-1)  # (B, T)
-
-        if mask is not None:
-            score = score.masked_fill(mask == 0, -1e9)
-
-        weight = torch.softmax(score, dim=1)  # (B, T)
-        pooled = torch.sum(x * weight.unsqueeze(-1), dim=1)  # (B, H)
-        return pooled, weight
 
 
 class MME2E(nn.Module):
@@ -52,10 +27,8 @@ class MME2E(nn.Module):
         if args['text_model_size'] == 'xlarge':
             text_cls_dim = 2048
 
-        # ===== Text =====
         self.T = MME2E_T(feature_dim=self.feature_dim, size=args['text_model_size'])
 
-        # ===== Vision =====
         self.mtcnn = MTCNN(
             image_size=48,
             margin=2,
@@ -82,60 +55,56 @@ class MME2E(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2),
         )
 
+        self.A = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=64, kernel_size=5, padding=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            VggBasicBlock(in_planes=64, out_planes=64),
+            VggBasicBlock(in_planes=64, out_planes=64),
+            VggBasicBlock(in_planes=64, out_planes=128),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            VggBasicBlock(in_planes=128, out_planes=256),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            VggBasicBlock(in_planes=256, out_planes=512),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
         self.v_flatten = nn.Sequential(
             nn.Linear(512 * 3 * 3, 1024),
             nn.ReLU(),
             nn.Linear(1024, trans_dim)
         )
-        self.v_transformer = WrappedTransformerEncoder(dim=trans_dim, num_layers=nlayers, num_heads=nheads)
 
-        # ===== Audio: Wav2Vec2 frozen =====
-        self.wav2vec2 = Wav2Vec2Model.from_pretrained(
-            "./models/wav2vec2-base",
-            local_files_only=True
-        )
-        for p in self.wav2vec2.parameters():
-            p.requires_grad = False
+        self.a_pool = nn.AdaptiveAvgPool2d((8, 2))
 
-        wav_dim = self.wav2vec2.config.hidden_size
-        self.a_pool = AttentivePooling(wav_dim)
-
-        self.a_proj = nn.Sequential(
-            nn.Linear(wav_dim, 1024),
+        self.a_flatten = nn.Sequential(
+            nn.Linear(512 * 8 * 2, 1024),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(1024, trans_dim),
-            nn.ReLU()
+            nn.Linear(1024, trans_dim)
         )
 
-        # 不再让 audio 走单 token transformer
+        self.v_transformer = WrappedTransformerEncoder(dim=trans_dim, num_layers=nlayers, num_heads=nheads)
+        self.a_transformer = WrappedTransformerEncoder(dim=trans_dim, num_layers=nlayers, num_heads=nheads)
+
+        self.v_out = nn.Linear(trans_dim, self.num_classes)
+        self.t_out = nn.Linear(text_cls_dim, self.num_classes)
         self.a_out = nn.Linear(trans_dim, self.num_classes)
 
-        # ===== Heads =====
-        self.t_out = nn.Linear(text_cls_dim, self.num_classes)
-        self.v_out = nn.Linear(trans_dim, self.num_classes)
-
-        # 融合层
         self.weighted_fusion = nn.Linear(len(self.mod), 1, bias=False)
-
-        # 更小的音频 gate，默认抑制音频
-        self.a_gate_raw = nn.Parameter(torch.tensor(-2.5))  # sigmoid ~ 0.076
-
-        self.debug = args.get('debug', False)
 
     def forward(self, imgs, imgs_lens, specs, spec_lens, text):
         all_logits = []
         device = next(self.parameters()).device
 
-        # ===== Text branch =====
+        # text branch
         if 't' in self.mod:
             text_cls = self.T(text, get_cls=True)
-            if self.debug:
-                print("[DEBUG][T] mean:", text_cls.mean().item(), "std:", text_cls.std().item())
             all_logits.append(self.t_out(text_cls))
 
-        # ===== Vision branch =====
+        # vision branch
         if 'v' in self.mod:
+            # imgs may come in as numpy array: (N, H, W, C)
             if isinstance(imgs, np.ndarray):
                 imgs = torch.from_numpy(imgs).permute(0, 3, 1, 2).float()
             elif isinstance(imgs, list):
@@ -145,12 +114,14 @@ class MME2E(nn.Module):
 
             faces_list = []
             for img in imgs:
+                # img: (3, H, W)
                 try:
                     face = self.mtcnn(img)
                 except Exception:
                     face = None
 
                 if face is None:
+                    # 无脸时，用中心裁剪兜底，保证每帧都有一个face tensor
                     if img.size(1) >= 48 and img.size(2) >= 48:
                         face = self.crop_img_center(img, target_size=48)
                     else:
@@ -169,68 +140,38 @@ class MME2E(nn.Module):
 
                 faces_list.append(face)
 
+            # 关键：faces 数量必须等于总帧数 sum(imgs_lens)
             faces = torch.stack(faces_list, dim=0).float().to(device)
+
             faces = self.V(faces)
             faces = self.v_flatten(faces.flatten(start_dim=1))
             faces = self.v_transformer(faces, imgs_lens, get_cls=True)
-
-            if self.debug:
-                print("[DEBUG][V] mean:", faces.mean().item(), "std:", faces.std().item())
-
             all_logits.append(self.v_out(faces))
 
-        # ===== Audio branch =====
+        # audio branch
         if 'a' in self.mod:
-            audio = specs.to(device).float()   # (B, T)
-            B, T = audio.shape
+            specs = specs.to(device).float()
+            for a_module in self.A:
+                specs = a_module(specs)
 
-            attention_mask = torch.zeros((B, T), dtype=torch.long, device=device)
-            for i, l in enumerate(spec_lens):
-                l = min(int(l), T)
-                attention_mask[i, :l] = 1
-
-            with torch.no_grad():
-                wav_out = self.wav2vec2(audio, attention_mask=attention_mask)
-
-            hidden = wav_out.last_hidden_state  # (B, T', H)
-
-            input_lengths = torch.tensor(spec_lens, device=device, dtype=torch.long)
-            feat_lengths = self.wav2vec2._get_feat_extract_output_lengths(input_lengths)
-            max_feat_len = hidden.size(1)
-
-            hidden_mask = torch.zeros((B, max_feat_len), dtype=torch.long, device=device)
-            for i, l in enumerate(feat_lengths):
-                l = min(int(l.item()), max_feat_len)
-                hidden_mask[i, :l] = 1
-
-            pooled, attn_weight = self.a_pool(hidden, hidden_mask)   # (B, H)
-            a_feat = self.a_proj(pooled)                             # (B, trans_dim)
-
-            if self.debug:
-                print("[DEBUG][A pooled] mean:", pooled.mean().item(), "std:", pooled.std().item())
-                print("[DEBUG][A feat] mean:", a_feat.mean().item(), "std:", a_feat.std().item())
-
-            a_gate = torch.sigmoid(self.a_gate_raw)
-            a_logits = 0.5 * a_gate * self.a_out(a_feat)
-
-            if self.debug:
-                print("[DEBUG][A_GATE]:", a_gate.item())
-
-            all_logits.append(a_logits)
-
-        if self.debug:
-            for i, lg in enumerate(all_logits):
-                print(f"[DEBUG][LOGIT_BRANCH_{i}] mean:", lg.mean().item(), "std:", lg.std().item())
+            specs = self.a_pool(specs)
+            specs = self.a_flatten(specs.flatten(start_dim=1))
+            specs = self.a_transformer(specs, spec_lens, get_cls=True)
+            all_logits.append(self.a_out(specs))
 
         if len(all_logits) == 1:
             return all_logits[0]
 
         return self.weighted_fusion(torch.stack(all_logits, dim=-1)).squeeze(-1)
-        logits = self.weighted_fusion(torch.stack(all_logits, dim=-1)).squeeze(-1)
-        logits = logits / 0.7
-        return logits
 
     def crop_img_center(self, img: torch.Tensor, target_size=48):
+        """
+        Some images have un-detectable faces.
+        To make training continue normally, for those images,
+        crop the center part, which likely contains the face.
+
+        img: (C, H, W)
+        """
         _, h, w = img.shape
         if h < target_size or w < target_size:
             out = torch.zeros(3, target_size, target_size, device=img.device, dtype=img.dtype)

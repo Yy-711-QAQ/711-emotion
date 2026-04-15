@@ -3,4 +3,4 @@ __pycache__
 data
 *.ipynb
 savings/
-.vscode/
+.vscode/*.bin

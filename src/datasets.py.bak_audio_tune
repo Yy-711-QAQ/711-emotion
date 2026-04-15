@@ -14,30 +14,7 @@ from typing import List, Dict, Tuple, Optional
 from src.utils import load, padTensor, get_max_len
 from PIL import Image
 
-#音频预处理函数
-def load_audio_waveform(audio_path, target_sr=16000, min_seconds=1.0):
-    if not os.path.exists(audio_path):
-        raise FileNotFoundError(f"Missing audio file: {audio_path}")
-    waveform, sr = torchaudio.load(audio_path)
-
-    # 转单声道
-    if waveform.dim() == 2 and waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-
-    # 重采样到 16k
-    if sr != target_sr:
-        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
-        sr = target_sr
-
-    # 太短补零到至少 1 秒
-    min_len = int(target_sr * min_seconds)
-    if waveform.shape[1] < min_len:
-        waveform = F.pad(waveform, (0, min_len - waveform.shape[1]))
-
-    return waveform.squeeze(0)  # (T,)
-
 audio_feature_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 655, 656, 657, 658, 659, 660, 661, 662, 663, 664, 665, 666, 667, 668, 669, 670, 671, 672, 673, 674, 675, 676, 677, 678, 679, 680, 681, 682, 683, 684, 685, 686, 687, 688, 689, 690, 691, 692, 693, 694, 695, 696, 697, 698, 699, 700, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712, 713, 714, 715, 716, 717, 718, 719, 720, 721, 722, 723, 724, 725, 726, 727, 728, 729, 730, 731, 732, 733, 734, 735, 736, 737, 738, 739, 740, 741, 742, 743, 744, 745, 746, 747, 748, 749, 750, 751, 752, 753, 754, 755, 756, 757, 758, 759, 760, 761, 762]
-
 # 音频特征选择索引（控制用哪些特征维度）
 EMOTIONTALK_LABELS = ['angry', 'disgusted', 'fearful', 'happy', 'neutral', 'sad', 'surprised']
 def getEmotionTalkDict() -> Dict[str, int]:
@@ -122,24 +99,6 @@ def get_dataset_emotiontalk(data_folder: str, phase: str, img_interval: int):
         'r',
         encoding='utf-8'
     ).read().splitlines()
-
-    bad_ids_path = os.path.join('outputs', 'bad_audio_ids.txt')
-    bad_ids = set()
-    if os.path.exists(bad_ids_path):
-        bad_ids = set(open(bad_ids_path, 'r', encoding='utf-8').read().splitlines())
-
-    main_folder = os.path.join(data_folder, 'EMOTIONTALK_RAW_PROCESSED')
-
-    filtered_ids = []
-    for sid in ids:
-        if sid in bad_ids:
-            continue
-        audio_path = os.path.join(main_folder, sid, 'audio.wav')
-        if not os.path.exists(audio_path):
-            continue
-        filtered_ids.append(sid)
-
-    ids = filtered_ids
 
     texts = [meta[sid]['text'] for sid in ids]
     labels = [meta[sid]['label'] for sid in ids]
@@ -270,6 +229,18 @@ class EmotionTalk(Dataset):
             sampled = [os.path.join(folder, 'image_0.jpg')]
         return sampled
 
+    def cutSpecToPieces(self, spec, stride=32):
+        total = -(-spec.size(-1) // stride)
+        specs = []
+        for i in range(total):
+            specs.append(spec[:, :, :, i * stride:(i + 1) * stride])
+
+        lastPieceLength = specs[-1].size(-1)
+        if lastPieceLength < stride:
+            padRight = stride - lastPieceLength
+            specs[-1] = F.pad(specs[-1], (0, padRight))
+        return specs
+
     def __len__(self):
         return len(self.ids)
 
@@ -297,11 +268,26 @@ class EmotionTalk(Dataset):
         else:
             sampledImgs = np.array(sampledImgs, dtype=np.float32)
 
-        # 音频：直接返回 waveform，供 Wav2Vec2 使用
-        audio_path = os.path.join(sample_folder, 'audio.wav')
-        waveform = load_audio_waveform(audio_path, target_sr=16000, min_seconds=1.0)
+        try:
+            waveform, sr = torchaudio.load(os.path.join(sample_folder, 'audio.wav'))
+        except Exception as e:
+            print(f"[WARN] Bad audio file")
+            waveform = torch.zeros(1, 16000)
+            sr = 16000
 
-        return this_id, sampledImgs, waveform, self.texts[ind], self.labels[ind]
+        # 强制单声道
+        if waveform.dim() == 2 and waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        specgram = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sr,
+            win_length=int(float(sr) / 16000 * 400),
+            n_fft=int(float(sr) / 16000 * 400)
+        )(waveform).unsqueeze(0)
+
+        specgrams = self.cutSpecToPieces(specgram)
+
+        return this_id, sampledImgs, specgrams, self.texts[ind], self.labels[ind]
     
 class IEMOCAP(Dataset):
     def __init__(self, main_folder: str, utterance_ids: List[str], texts: List[List[int]], labels: List[int],
@@ -415,15 +401,14 @@ def collate_fn(batch):
     newSampledImgs = None
     imgSeqLens = []
 
-    audio_features = []
-    audio_lens = []
+    specgrams = []
+    specgramSeqLens = []
 
     for dp in batch:
-        utteranceId, sampledImgs, waveform, text, label = dp
+        utteranceId, sampledImgs, specgram, text, label = dp
         sampledImgs = np.asarray(sampledImgs, dtype=np.float32)
         if sampledImgs.shape[0] == 0:
             continue
-
         utterance_ids.append(utteranceId)
         texts.append(text)
         labels.append(label)
@@ -431,25 +416,17 @@ def collate_fn(batch):
         imgSeqLens.append(sampledImgs.shape[0])
         newSampledImgs = sampledImgs if newSampledImgs is None else np.concatenate((newSampledImgs, sampledImgs), axis=0)
 
-        audio_lens.append(waveform.shape[0])
-        audio_features.append(waveform)
+        specgramSeqLens.append(len(specgram))
+        specgrams.append(torch.cat(specgram, dim=0))
 
     imgs = newSampledImgs
-
-    max_audio_len = max(audio_lens)
-    padded_audio = []
-    for wav in audio_features:
-        if wav.shape[0] < max_audio_len:
-            wav = F.pad(wav, (0, max_audio_len - wav.shape[0]))
-        padded_audio.append(wav.unsqueeze(0))
-    padded_audio = torch.cat(padded_audio, dim=0)  # (B, T)
 
     return (
         utterance_ids,
         imgs,
         imgSeqLens,
-        padded_audio,
-        audio_lens,
+        torch.cat(specgrams, dim=0),
+        specgramSeqLens,
         texts,
         torch.from_numpy(np.array(labels, dtype=np.float32))
     )
