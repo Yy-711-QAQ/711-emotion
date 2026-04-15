@@ -1,4 +1,6 @@
-__pycache__
+*.bin
+pretrained/
+models/__pycache__
 *.pt
 data
 *.ipynb
